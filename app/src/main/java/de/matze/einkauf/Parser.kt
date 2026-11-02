@@ -40,6 +40,8 @@ class Parser(known: Map<String, String>) {
         private val SPLIT_RE = Regex(";|,|!+|\\s+\\+\\s+|\\+|\\s+(?:und|sowie|oraz|i)\\s+", RegexOption.IGNORE_CASE)
         private val BULLET_RE = Regex("^\\s*(?:[-*•·–—>]|\\d+[.)]\\s|\\[\\s?[x ]?\\])\\s*", RegexOption.IGNORE_CASE)
         private val TRAIL_RE = Regex("[.?:]+$")
+        private val PAREN_ONLY_RE = Regex("^\\(.*\\)$")
+        private val STORE_LINE_RE = Regex("[\\s:\\-–]+$")
         private val MULTISPACE_RE = Regex("\\s{2,}")
         private val WS_RE = Regex("\\s+")
 
@@ -48,7 +50,7 @@ class Parser(known: Map<String, String>) {
             Regex("^(hallo|hi|hey|hej|cześć|czesc|kochanie|schatz|liebling|skarbie)\\b[^,]*[,!]?", RegexOption.IGNORE_CASE) to false,
             Regex("\\b(kannst|könntest|koenntest|kanst) du (bitte |noch |mal )*", RegexOption.IGNORE_CASE) to true,
             Regex("\\b(bitte|noch|mal|danke|dziękuję|dzieki|dzięki|proszę|prosze|jeszcze|też|tez)\\b", RegexOption.IGNORE_CASE) to true,
-            Regex("\\b(mitbringen|einkaufen|kaufen|besorgen|holen|hol|kup|kupić|kupic|weź|wez)\\b", RegexOption.IGNORE_CASE) to true,
+            Regex("\\b(mitbringen|mitnehmen|einkaufen|kaufen|besorgen|holen|hol|kup|kupić|kupic|weź|wez)\\b", RegexOption.IGNORE_CASE) to true,
             Regex("\\b(wir brauchen|brauchen wir|ich brauche|potrzebujemy|potrzebuję|potrzebuje)\\b", RegexOption.IGNORE_CASE) to true,
             Regex("^(und|i|oraz|sowie|auch)\\s+", RegexOption.IGNORE_CASE) to false
         )
@@ -75,7 +77,8 @@ class Parser(known: Map<String, String>) {
         /** Erste passende Regel gewinnt. "*" am Anfang = nur als ganzes Wort. */
         private val RULES: List<Pair<String, List<Any>>> = listOf(
             "obst" to "wassermelone",
-            "vorrat" to "frikas konserve dose tomatenmark passata",
+            "fruehstueck" to "marmelade konfitüre",
+            "vorrat" to "frikas konserve dose tomatenmark passata erasco eintopf maggi brühwürfel bigos",
             "suess" to "schokolade chips",
             "tk" to "(tk) tiefkühl tiefkuehl *tk pizza *eis eiscreme pommes fischstäbchen mrożon lody",
             "tier" to "katze futter leckerli streu hund kot karma żwirek",
@@ -106,9 +109,43 @@ class Parser(known: Map<String, String>) {
         .sortedByDescending { it.length }
         .map { k -> k to (if (k.length < 5) Regex("(^|[^$LETTER])" + Regex.escape(k) + "($|[^$LETTER])") else null) }
 
+    /** Trennt an SPLIT_RE, aber nie innerhalb von Klammern ("Milka 2x (Smarties, Biscoff)"). */
+    private fun splitOutsideParens(line: String): List<String> {
+        val masked = StringBuilder(line.length)
+        var depth = 0
+        for (c in line) {
+            when (c) {
+                '(' -> { depth++; masked.append(c) }
+                ')' -> { if (depth > 0) depth--; masked.append(c) }
+                else -> masked.append(if (depth > 0) '\u0002' else c)
+            }
+        }
+        val out = mutableListOf<String>()
+        var start = 0
+        for (m in SPLIT_RE.findAll(masked)) {
+            out.add(line.substring(start, m.range.first))
+            start = m.range.last + 1
+        }
+        out.add(line.substring(start))
+        return out
+    }
+
+    /** Nur Menge/Einheit wie "4 Stück", "2x", "500 g". */
+    private fun isQtyOnly(p: String): Boolean {
+        val words = p.lowercase().split(WS_RE).filter { it.isNotEmpty() }
+        return words.isNotEmpty() && words.any { NUM_RE.matches(it) } &&
+            words.all { NUM_RE.matches(it) || it in PRE }
+    }
+
+    /** Zeile, die nur aus einem Laden besteht ("Netto", "Lidl:") → Name, sonst null. */
+    private fun storeLine(line: String): String? {
+        val l = STORE_LINE_RE.replace(line.trim(), "").lowercase()
+        return if (l in STORES) l else null
+    }
+
     private fun splitRun(chunk: String): List<String> {
         val words = chunk.split(WS_RE).filter { it.isNotEmpty() }
-        if (words.size < 3 || GLUE.containsMatchIn(chunk)) return listOf(chunk)
+        if (words.size < 3 || GLUE.containsMatchIn(chunk) || chunk.contains('(')) return listOf(chunk)
         val out = mutableListOf<String>()
         var cur = mutableListOf<String>()
         for (w in words) {
@@ -145,10 +182,19 @@ class Parser(known: Map<String, String>) {
         val result = mutableListOf<Raw>()
         var store: String? = null
 
-        for (line in t.split("\n")) {
+        val lines = t.split("\n")
+        // Zettel mit einem Produkt pro Zeile: Zeilen nicht mehr an Leerzeichen zerlegen,
+        // sonst wird aus "Vegetarische Mortadella Rügenwalder 2x" drei Einträge.
+        val listMode = lines.count { l ->
+            l.isNotBlank() && STORE_MARK_RE.find(l) == null && storeLine(l) == null
+        } >= 2
+
+        for (line in lines) {
             val sm = STORE_MARK_RE.find(line)
             if (sm != null) { store = cap(sm.groupValues[1]); continue }
-            for (part in line.split(SPLIT_RE)) {
+            val sl = storeLine(line)
+            if (sl != null) { store = cap(sl); continue }
+            for (part in splitOutsideParens(line)) {
                 var p = BULLET_RE.replaceFirst(part, "")
                 for ((re, global) in FILLER) {
                     p = if (global) re.replace(p, " ") else re.replaceFirst(p, " ")
@@ -161,7 +207,12 @@ class Parser(known: Map<String, String>) {
                     result[result.size - 1].text += " $p"
                     continue
                 }
-                for (x in splitRun(p)) {
+                // "(Kasten)" nach "+" oder "4 Stück" nach Komma gehört zum vorherigen Produkt
+                if (result.isNotEmpty() && (PAREN_ONLY_RE.matches(p) || isQtyOnly(p))) {
+                    result[result.size - 1].text += " $p"
+                    continue
+                }
+                for (x in if (listMode) listOf(p) else splitRun(p)) {
                     if (x.length > 1 && x.length < 60) result.add(Raw(x, store))
                 }
             }
